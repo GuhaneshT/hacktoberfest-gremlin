@@ -80,10 +80,12 @@ class FailproofSession:
         chaos_root: Path,
         target_path: Path,
         session_id: str,
+        target_root: Path | None = None,
     ) -> None:
         self.workspace_root = workspace_root.resolve()
         self.chaos_root = chaos_root.resolve()
         self.target_path = target_path.resolve()
+        self.target_root = target_root.resolve() if target_root else None
         self.session_id = session_id
 
         self.tool_calls = 0
@@ -243,8 +245,16 @@ class FailproofSession:
             self._deny("Read", "A file path is required.")
 
         path = self._resolve(raw_path)
-        if path != self.target_path and not self._is_within(path, self.workspace_root):
-            self._deny("Read", f"Reads are limited to the workspace or target: {path}")
+        allowed = (
+            path == self.target_path
+            or self._is_within(path, self.workspace_root)
+            or (self.target_root is not None and self._is_within(path, self.target_root))
+        )
+        if not allowed:
+            self._deny(
+                "Read",
+                f"Reads are limited to the workspace, target, or target root: {path}",
+            )
 
         for pattern in _SENSITIVE_READS:
             if pattern.search(path.name):
@@ -252,8 +262,14 @@ class FailproofSession:
 
     def _authorize_list_dir(self, payload: dict[str, Any]) -> None:
         path = self._resolve(_as_text(payload.get("path")) or ".")
-        if not self._is_within(path, self.workspace_root):
-            self._deny("ListDir", f"Directory listing is limited to the workspace: {path}")
+        allowed = self._is_within(path, self.workspace_root) or (
+            self.target_root is not None and self._is_within(path, self.target_root)
+        )
+        if not allowed:
+            self._deny(
+                "ListDir",
+                f"Directory listing is limited to the workspace or target root: {path}",
+            )
 
     def _authorize_bash(self, payload: dict[str, Any]) -> None:
         command = _as_text(payload.get("command"))

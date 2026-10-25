@@ -7,14 +7,24 @@ import re
 import subprocess
 import sys
 import tempfile
+import tokenize
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
 from agent.failproof import FailproofSession, PolicyViolation, format_command
+from agent.llm import GeneratedTest, LLMClient, LLMError, validate_test_code
+from agent.prompts import GREMLIN_SYSTEM_PROMPT
+from agent.repo import (
+    PROJECT_ROOT,
+    RepoFile,
+    RepoIndex,
+    resolve_target_path,
+    scan_repository,
+)
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = PROJECT_ROOT
 TARGETS_DIR = BASE_DIR / "targets"
 SAMPLE_TARGET = TARGETS_DIR / "calculator.py"
 CHAOS_ROOT = BASE_DIR / "tests" / "chaos"
@@ -22,34 +32,8 @@ PYTEST_TIMEOUT_SECONDS = 30
 
 Intensity = Literal["mild", "spicy", "nuclear"]
 
-GREMLIN_SYSTEM_PROMPT = """
-You are Gremlin, a specialized Chaos Engineering agent.
-
-Your only job is to find ways to make the provided target code fail.
-
-Rules:
-- You may only write test files inside the /tests/chaos/ directory.
-- You must NEVER modify the original source code.
-- You must NEVER run destructive shell commands (rm -rf, git push --force, sudo, etc.).
-- Prefer small, precise tests over large complicated ones.
-- Each test should target one clear failure mode.
-- After writing tests, execute them and report the results honestly.
-- If a policy blocks you, accept it and try a safer alternative.
-
-Intensity levels:
-- mild: normal edge cases (None, empty, zero, wrong types)
-- spicy: larger values, nested structures, repeated calls
-- nuclear: concurrency ideas, very large inputs, timeouts (still stay safe)
-
-Always follow this process:
-1. Summarize what the target does in 1-2 sentences.
-2. List 3-5 interesting failure hypotheses.
-3. Write the corresponding test files inside /tests/chaos/.
-4. Run the tests using pytest.
-5. Return a structured report.
-""".strip()
-
 _TEST_HEADER = """\
+import importlib
 import importlib.util
 import os
 
@@ -94,6 +78,8 @@ class ChaosCandidate:
     failure_mode: str
     priority: int
     body: str
+    target_file: str | None = None
+    target_module: str | None = None
 
 
 @dataclass(frozen=True)
@@ -108,7 +94,37 @@ def run_chaos(
     target_code: str | None,
     intensity: Intensity,
     max_tests: int,
+    target_path: str | None = None,
 ) -> dict[str, Any]:
+    if target_path is not None:
+        if target_code is not None:
+            raise TargetAnalysisError(
+                "Provide either target_code or target_path, not both."
+            )
+        resolved = resolve_target_path(target_path)
+        if resolved.is_dir():
+            index = scan_repository(resolved)
+            if not index.files:
+                raise TargetAnalysisError(
+                    f"No readable Python modules were found under {resolved}."
+                )
+            agent = GremlinAgent(
+                target_path=None,
+                repo_path=resolved,
+                repo_index=index,
+                intensity=intensity,
+                max_tests=max_tests,
+            )
+        else:
+            agent = GremlinAgent(
+                target_path=resolved,
+                repo_path=resolved.parent,
+                repo_index=None,
+                intensity=intensity,
+                max_tests=max_tests,
+            )
+        return agent.run()
+
     source_code = (
         target_code
         if target_code is not None
@@ -116,10 +132,12 @@ def run_chaos(
     )
 
     with tempfile.TemporaryDirectory(prefix="gremlin-target-") as temporary_directory:
-        target_path = Path(temporary_directory) / "target.py"
-        target_path.write_text(source_code, encoding="utf-8")
+        copied_target = Path(temporary_directory) / "target.py"
+        copied_target.write_text(source_code, encoding="utf-8")
         agent = GremlinAgent(
-            target_path=target_path,
+            target_path=copied_target,
+            repo_path=copied_target.parent,
+            repo_index=None,
             intensity=intensity,
             max_tests=max_tests,
         )
@@ -130,98 +148,68 @@ class GremlinAgent:
     def __init__(
         self,
         *,
-        target_path: Path,
+        target_path: Path | None,
+        repo_path: Path | None,
+        repo_index: RepoIndex | None,
         intensity: Intensity,
         max_tests: int,
     ) -> None:
-        self.target_path = target_path.resolve()
+        self.target_path = target_path.resolve() if target_path else None
+        self.repo_index = repo_index
+        if repo_index is not None:
+            self.repo_path = repo_index.root.resolve()
+        elif repo_path is not None:
+            self.repo_path = repo_path.resolve()
+        elif self.target_path is not None:
+            self.repo_path = self.target_path.parent
+        else:
+            raise ValueError("A target path or repository index is required.")
+
         self.intensity = intensity
         self.max_tests = max_tests
         self.session_id = f"fp_{uuid.uuid4().hex[:12]}"
         self.session_dir = CHAOS_ROOT / f"session_{self.session_id}"
+        self._integrity: dict[Path, str] = {}
 
     def run(self) -> dict[str, Any]:
         CHAOS_ROOT.mkdir(parents=True, exist_ok=True)
-        source_digest = hashlib.sha256(self.target_path.read_bytes()).hexdigest()
         notes: list[str] = []
+        client = LLMClient.from_env()
+        if client is not None:
+            notes.append(f"LLM planner active with model '{client.model}'.")
+        else:
+            notes.append(
+                "No LLM is configured; the deterministic planner is active. "
+                "Set GREMLIN_LLM_BASE_URL and optionally GREMLIN_LLM_API_KEY to enable it."
+            )
 
         with FailproofSession(
             workspace_root=BASE_DIR,
             chaos_root=CHAOS_ROOT,
-            target_path=self.target_path,
+            target_path=self.target_path or self.repo_path,
+            target_root=self.repo_path,
             session_id=self.session_id,
         ) as failproof:
-            source = failproof.invoke_tool(
-                "Read",
-                {"file_path": str(self.target_path)},
-                lambda: self.target_path.read_text(encoding="utf-8"),
-            )
             failproof.invoke_tool(
                 "ListDir",
                 {"path": str(CHAOS_ROOT)},
                 lambda: sorted(path.name for path in CHAOS_ROOT.iterdir()),
             )
-            analysis = analyze_target(source)
-            hypotheses = build_hypotheses(analysis.functions, self.intensity)
-            candidates = select_candidates(
-                build_candidates(analysis.functions, self.intensity),
-                self.max_tests,
+
+            if self.repo_index is not None:
+                summary, hypotheses, test_results = self._run_repo(
+                    failproof, client, notes
+                )
+            else:
+                summary, hypotheses, test_results = self._run_single(
+                    failproof, client, notes
+                )
+
+            self._verify_integrity(notes)
+            self._append_failproof_notes(failproof, notes)
+            notes.append(
+                f"Generated tests are retained in {self.session_dir.relative_to(BASE_DIR)}."
             )
-
-            test_results: list[dict[str, str]] = []
-            for index, candidate in enumerate(candidates, start=1):
-                test_path = self._test_path(index, candidate)
-                content = f"{_TEST_HEADER}\n\n{candidate.body.strip()}\n"
-                try:
-                    failproof.invoke_tool(
-                        "Write",
-                        {"file_path": str(test_path), "content": content},
-                        lambda path=test_path, text=content: self._write_file(path, text),
-                    )
-                except PolicyViolation as exc:
-                    notes.append(f"Failproof blocked a generated test write: {exc.reason}")
-                    continue
-
-                test_results.append(
-                    self._run_test_file(
-                        failproof,
-                        test_path=test_path,
-                        failure_mode=candidate.failure_mode,
-                    )
-                )
-
-            after_digest = hashlib.sha256(self.target_path.read_bytes()).hexdigest()
-            if after_digest == source_digest:
-                notes.append(
-                    "No workspace source files were written; the target copy remained "
-                    "unchanged (SHA-256 verified)."
-                )
-            else:
-                notes.append(
-                    "SOURCE INTEGRITY ALERT: the temporary target copy changed during the run."
-                )
-
-            if failproof.blocks:
-                notes.append(
-                    f"Failproof blocked {failproof.blocks} unsafe action(s): "
-                    + " | ".join(failproof.blocked_events[:3])
-                )
-            if failproof.loops_stopped:
-                notes.append(
-                    f"Failproof stopped {failproof.loops_stopped} repeated loop(s)."
-                )
-            if failproof.sdk_active:
-                notes.append("Failproof SDK tracing was active for this session.")
-                if failproof.sdk_error:
-                    notes.append(f"Failproof SDK reported: {failproof.sdk_error}")
-            elif failproof.sdk_error:
-                notes.append(f"Failproof SDK trace unavailable: {failproof.sdk_error}")
-            else:
-                notes.append(
-                    "Failproof SDK was not importable; embedded policy enforcement was active."
-                )
-
-            notes.append(f"Generated tests are retained in {self.session_dir.relative_to(BASE_DIR)}.")
             metrics = failproof.metrics()
 
         failures_triggered = sum(
@@ -229,7 +217,7 @@ class GremlinAgent:
         )
 
         return {
-            "summary": analysis.summary,
+            "summary": summary,
             "hypotheses": hypotheses,
             "tests": test_results,
             "failures_triggered": failures_triggered,
@@ -237,10 +225,293 @@ class GremlinAgent:
             "notes": " ".join(notes),
         }
 
-    def _test_path(self, index: int, candidate: ChaosCandidate) -> Path:
-        target = candidate.function_name or "module"
+    def _run_single(
+        self,
+        failproof: FailproofSession,
+        client: LLMClient | None,
+        notes: list[str],
+    ) -> tuple[str, list[str], list[dict[str, str]]]:
+        if self.target_path is None:
+            raise TargetAnalysisError("A single-file target path is required.")
+
+        source = self._read_source(failproof, self.target_path)
+        analysis = analyze_target(source)
+        hypotheses = build_hypotheses(analysis.functions, self.intensity)
+        test_results: list[dict[str, str]] = []
+        used_llm = False
+
+        if client is not None:
+            try:
+                plan = client.plan_file(
+                    filename=self.target_path.name,
+                    source=_truncate_source(source),
+                    intensity=self.intensity,
+                    max_tests=self.max_tests,
+                )
+            except LLMError as exc:
+                notes.append(
+                    f"LLM planning failed ({str(exc)[:180]}); "
+                    "deterministic fallback used."
+                )
+            else:
+                used_llm = True
+                hypotheses = _complete_hypotheses(list(plan.hypotheses), hypotheses)
+                for index, generated in enumerate(plan.tests, start=1):
+                    result = self._run_generated_test(
+                        failproof,
+                        generated=generated,
+                        index=index,
+                        target_path=self.target_path,
+                        notes=notes,
+                    )
+                    if result is not None:
+                        test_results.append(result)
+                if not test_results:
+                    notes.append(
+                        "The LLM plan produced no runnable tests; "
+                        "deterministic fallback used."
+                    )
+
+        if not used_llm or not test_results:
+            candidates = select_candidates(
+                build_candidates(analysis.functions, self.intensity),
+                self.max_tests,
+            )
+            for index, candidate in enumerate(candidates, start=1):
+                result = self._run_candidate(
+                    failproof,
+                    candidate=candidate,
+                    index=index,
+                    target_path=self.target_path,
+                    notes=notes,
+                )
+                if result is not None:
+                    test_results.append(result)
+
+        return analysis.summary, hypotheses, test_results
+
+    def _run_repo(
+        self,
+        failproof: FailproofSession,
+        client: LLMClient | None,
+        notes: list[str],
+    ) -> tuple[str, list[str], list[dict[str, str]]]:
+        index = self.repo_index
+        if index is None:
+            raise TargetAnalysisError("A repository index is required.")
+
+        summary = index.summary()
+        hypotheses = _repo_hypotheses(index, self.intensity)
+        test_results: list[dict[str, str]] = []
+        selected_names: set[str] = set()
+
+        if client is not None:
+            try:
+                plan = client.plan_repo(
+                    index=index,
+                    intensity=self.intensity,
+                    max_tests=self.max_tests,
+                )
+            except LLMError as exc:
+                notes.append(
+                    f"LLM repository planning failed ({str(exc)[:180]}); "
+                    "deterministic fallback used."
+                )
+            else:
+                hypotheses = _complete_hypotheses(list(plan.hypotheses), hypotheses)
+                for index_number, target in enumerate(plan.targets, start=1):
+                    file = index.get(target.rel_path)
+                    if file is None:
+                        continue
+                    source = self._read_source(failproof, file.path)
+                    try:
+                        generated = client.generate_repo_test(
+                            file=file,
+                            source=_truncate_source(source),
+                            target=target,
+                        )
+                    except LLMError as exc:
+                        notes.append(
+                            f"LLM test generation failed for {file.rel_path} "
+                            f"({str(exc)[:140]})."
+                        )
+                        continue
+                    result = self._run_generated_test(
+                        failproof,
+                        generated=generated,
+                        index=index_number,
+                        target_path=file.path,
+                        notes=notes,
+                    )
+                    if result is not None:
+                        test_results.append(result)
+                        selected_names.add(file.rel_path)
+
+                if test_results:
+                    notes.append(
+                        f"LLM selected and tested {len(selected_names)} repository file(s)."
+                    )
+                else:
+                    notes.append(
+                        "The LLM repository plan produced no runnable tests; "
+                        "deterministic fallback used."
+                    )
+
+        if not test_results:
+            for index_number, (candidate, file) in enumerate(
+                _select_repo_candidates(
+                    _repo_candidates(index, self.intensity), self.max_tests
+                ),
+                start=1,
+            ):
+                self._read_source(failproof, file.path)
+                result = self._run_candidate(
+                    failproof,
+                    candidate=candidate,
+                    index=index_number,
+                    target_path=file.path,
+                    notes=notes,
+                )
+                if result is not None:
+                    test_results.append(result)
+
+        return summary, hypotheses, test_results
+
+    def _read_source(self, failproof: FailproofSession, path: Path) -> str:
+        def read() -> str:
+            self._integrity[path] = hashlib.sha256(path.read_bytes()).hexdigest()
+            with tokenize.open(path) as handle:
+                return handle.read()
+
+        return failproof.invoke_tool(
+            "Read",
+            {"file_path": str(path)},
+            read,
+        )
+
+    def _run_candidate(
+        self,
+        failproof: FailproofSession,
+        *,
+        candidate: ChaosCandidate,
+        index: int,
+        target_path: Path,
+        notes: list[str],
+    ) -> dict[str, str] | None:
+        test_path = self._test_path(
+            index,
+            function_name=candidate.function_name,
+            slug=candidate.slug,
+            target_file=candidate.target_file,
+        )
+        content = f"{_TEST_HEADER}\n\n{candidate.body.strip()}\n"
+        try:
+            failproof.invoke_tool(
+                "Write",
+                {"file_path": str(test_path), "content": content},
+                lambda path=test_path, text=content: self._write_file(path, text),
+            )
+        except PolicyViolation as exc:
+            notes.append(f"Failproof blocked a generated test write: {exc.reason}")
+            return None
+
+        return self._run_test_file(
+            failproof,
+            test_path=test_path,
+            failure_mode=candidate.failure_mode,
+            target_path=target_path,
+        )
+
+    def _run_generated_test(
+        self,
+        failproof: FailproofSession,
+        *,
+        generated: GeneratedTest,
+        index: int,
+        target_path: Path,
+        notes: list[str],
+    ) -> dict[str, str] | None:
+        error = validate_test_code(generated.code)
+        if error:
+            notes.append(f"Discarded an invalid LLM test: {error}")
+            return None
+
+        candidate = ChaosCandidate(
+            function_name=generated.function_name,
+            slug=_slugify(generated.failure_mode),
+            failure_mode=generated.failure_mode,
+            priority=0,
+            body=generated.code,
+            target_file=generated.target_file,
+            target_module=generated.target_module,
+        )
+        return self._run_candidate(
+            failproof,
+            candidate=candidate,
+            index=index,
+            target_path=target_path,
+            notes=notes,
+        )
+
+    def _verify_integrity(self, notes: list[str]) -> None:
+        if not self._integrity:
+            notes.append("No target source files were read; integrity check was skipped.")
+            return
+
+        changed = [
+            str(path)
+            for path, digest in self._integrity.items()
+            if not path.exists()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != digest
+        ]
+        if changed:
+            notes.append(
+                "SOURCE INTEGRITY ALERT: target file(s) changed during the run: "
+                + ", ".join(changed[:3])
+            )
+            return
+        notes.append(
+            "No target source files were written; all selected target file(s) "
+            "remained unchanged (SHA-256 verified)."
+        )
+
+    @staticmethod
+    def _append_failproof_notes(
+        failproof: FailproofSession, notes: list[str]
+    ) -> None:
+        if failproof.blocks:
+            notes.append(
+                f"Failproof blocked {failproof.blocks} unsafe action(s): "
+                + " | ".join(failproof.blocked_events[:3])
+            )
+        if failproof.loops_stopped:
+            notes.append(
+                f"Failproof stopped {failproof.loops_stopped} repeated loop(s)."
+            )
+        if failproof.sdk_active:
+            notes.append("Failproof SDK tracing was active for this session.")
+            if failproof.sdk_error:
+                notes.append(f"Failproof SDK reported: {failproof.sdk_error}")
+        elif failproof.sdk_error:
+            notes.append(f"Failproof SDK trace unavailable: {failproof.sdk_error}")
+        else:
+            notes.append(
+                "Failproof SDK was not importable; embedded policy enforcement was active."
+            )
+
+    def _test_path(
+        self,
+        index: int,
+        *,
+        function_name: str | None,
+        slug: str,
+        target_file: str | None = None,
+    ) -> Path:
+        target = function_name or (
+            Path(target_file).stem if target_file else "module"
+        )
         safe_target = re.sub(r"[^a-zA-Z0-9_]+", "_", target).strip("_").lower()
-        return self.session_dir / f"test_{index:02d}_{safe_target}_{candidate.slug}.py"
+        return self.session_dir / f"test_{index:02d}_{safe_target}_{slug}.py"
 
     @staticmethod
     def _write_file(path: Path, content: str) -> None:
@@ -255,6 +526,7 @@ class GremlinAgent:
         *,
         test_path: Path,
         failure_mode: str,
+        target_path: Path,
     ) -> dict[str, str]:
         argv = [
             sys.executable,
@@ -277,7 +549,7 @@ class GremlinAgent:
             result = failproof.invoke_tool(
                 "Bash",
                 payload,
-                lambda: self._execute_pytest(argv),
+                lambda: self._execute_pytest(argv, target_path),
             )
             passed = result.returncode == 0
             output = combine_output(result)
@@ -295,11 +567,16 @@ class GremlinAgent:
             "output": trim_output(output),
         }
 
-    def _execute_pytest(self, argv: list[str]) -> CommandResult:
+    def _execute_pytest(self, argv: list[str], target_path: Path) -> CommandResult:
         env = os.environ.copy()
-        env["GREMLIN_TARGET_PATH"] = str(self.target_path)
+        env["GREMLIN_TARGET_PATH"] = str(target_path)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONHASHSEED"] = "0"
+        repo_root = str(self.repo_path)
+        existing_path = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = (
+            repo_root + os.pathsep + existing_path if existing_path else repo_root
+        )
         try:
             completed = subprocess.run(
                 argv,
@@ -324,6 +601,129 @@ class GremlinAgent:
                 stderr=(stderr or "")
                 + f"\nTimed out after {PYTEST_TIMEOUT_SECONDS} seconds.",
             )
+
+
+def _repo_candidates(
+    index: RepoIndex, intensity: Intensity
+) -> list[tuple[ChaosCandidate, RepoFile]]:
+    candidates: list[tuple[ChaosCandidate, RepoFile]] = []
+    for file in index.files:
+        if not file.functions and not file.classes:
+            continue
+        functions = tuple(
+            FunctionInfo(
+                name=function.name,
+                args=function.args,
+                has_division=function.has_division,
+                is_async=function.is_async,
+            )
+            for function in file.functions
+        )
+        for candidate in build_candidates(functions, intensity):
+            candidates.append(
+                (
+                    replace(
+                        candidate,
+                        target_file=file.rel_path,
+                        target_module=file.module,
+                    ),
+                    file,
+                )
+            )
+    return candidates
+
+
+def _select_repo_candidates(
+    candidates: list[tuple[ChaosCandidate, RepoFile]], max_tests: int
+) -> list[tuple[ChaosCandidate, RepoFile]]:
+    by_file: dict[str, list[tuple[ChaosCandidate, RepoFile]]] = {}
+    for candidate, file in candidates:
+        by_file.setdefault(file.rel_path, []).append((candidate, file))
+
+    groups = sorted(
+        by_file.values(),
+        key=lambda group: (
+            min(candidate.priority for candidate, _ in group),
+            group[0][1].rel_path,
+        ),
+    )
+
+    selected: list[tuple[ChaosCandidate, RepoFile]] = []
+    covered: set[tuple[str, str | None]] = set()
+
+    for group in groups:
+        candidate, file = min(
+            group,
+            key=lambda item: (
+                item[0].priority,
+                item[0].function_name or "",
+                item[0].slug,
+            ),
+        )
+        selected.append((candidate, file))
+        covered.add((file.rel_path, candidate.function_name))
+        if len(selected) >= max_tests:
+            return selected
+
+    for group in groups:
+        for candidate, file in sorted(
+            group,
+            key=lambda item: (
+                item[0].priority,
+                item[0].function_name or "",
+                item[0].slug,
+            ),
+        ):
+            key = (file.rel_path, candidate.function_name)
+            if key in covered:
+                continue
+            selected.append((candidate, file))
+            covered.add(key)
+            if len(selected) >= max_tests:
+                return selected
+
+    return selected
+
+
+def _repo_hypotheses(index: RepoIndex, intensity: Intensity) -> list[str]:
+    functions = tuple(
+        FunctionInfo(
+            name=function.name,
+            args=function.args,
+            has_division=function.has_division,
+            is_async=function.is_async,
+        )
+        for file in index.files
+        for function in file.functions
+    )
+    hypotheses = list(build_hypotheses(functions, intensity))
+    hypotheses.insert(
+        0,
+        f"A repository with {len(index.files)} module(s) may hide failures "
+        "that are not visible from a single entry point.",
+    )
+    return hypotheses[:5]
+
+
+def _complete_hypotheses(primary: list[str], fallback: list[str]) -> list[str]:
+    result = list(dict.fromkeys(item for item in primary if item.strip()))
+    for item in fallback:
+        if len(result) >= 5:
+            break
+        if item not in result:
+            result.append(item)
+    return result[:5]
+
+
+def _slugify(value: str, *, limit: int = 40) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_]+", "_", value).strip("_").lower()
+    return slug[:limit].strip("_") or "llm_test"
+
+
+def _truncate_source(source: str, *, limit: int = 16000) -> str:
+    if len(source) <= limit:
+        return source
+    return source[:limit] + "\n# ... source truncated ..."
 
 
 def analyze_target(source: str) -> TargetAnalysis:

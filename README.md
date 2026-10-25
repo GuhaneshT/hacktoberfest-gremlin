@@ -1,16 +1,20 @@
 # GremlinAPI
 
-GremlinAPI is an API-first chaos engineering agent. Send it Python code, and **Gremlin** writes adversarial pytest cases, runs them, and returns an honest report of what broke. **Failproof AI** observes every tool call and enforces the safety boundary around the run.
+GremlinAPI is an API-first chaos engineering agent. Give it Python code, a local Python file, or a repository directory, and **Gremlin** writes adversarial pytest cases, runs them, and returns an honest report of what broke. **Failproof AI** observes every tool call and enforces the safety boundary around the run.
 
 ## What it does
 
-1. Accepts source code through `POST /chaos` (or uses the bundled calculator target).
-2. Parses the target and forms failure hypotheses.
-3. Writes small, focused pytest files to `tests/chaos/session_<id>/`.
-4. Executes each test with a timeout and records the real pytest output.
-5. Returns hypotheses, test outcomes, failure count, and Failproof session metrics.
+1. Accepts `target_code`, `target_path` (file or directory), or uses the bundled calculator target.
+2. Scans repositories, ranks candidate modules, and forms failure hypotheses.
+3. Uses an optional OpenAI-compatible LLM for repository selection and test generation.
+4. Falls back to a deterministic planner when no LLM is configured or the LLM fails.
+5. Writes small, focused pytest files to `tests/chaos/session_<id>/`.
+6. Executes each test with a timeout and records the real pytest output.
+7. Returns hypotheses, test outcomes, failure count, and Failproof session metrics.
 
-The service never writes to the original source. Target code executes from a temporary copy, and a SHA-256 check verifies that working copy before and after every run.
+The service never writes to the original source. Inline and sample code runs from a temporary copy; local targets are read-only. A SHA-256 check verifies every selected target file before and after the run.
+
+Repository access is restricted to the project root by default. Set `GREMLIN_TARGET_ROOT` to allow another directory, or `GREMLIN_ALLOW_ANY_TARGET=1` to disable the root check for a disposable environment.
 
 ## Quickstart
 
@@ -49,6 +53,16 @@ curl -X POST http://localhost:8000/chaos ^
   -d "{\"target_code\":\"def average(values):\n    return sum(values) / len(values)\",\"intensity\":\"nuclear\",\"max_tests\":5}"
 ```
 
+Attack a local file or an entire repository:
+
+```bash
+curl -X POST http://localhost:8000/chaos ^
+  -H "Content-Type: application/json" ^
+  -d "{\"target_path\":\"C:\\\\work\\\\my-repo\",\"intensity\":\"spicy\",\"max_tests\":5}"
+```
+
+`target_code` and `target_path` are mutually exclusive. Relative paths resolve from the project root. A directory is scanned recursively for Python modules; test files, hidden directories, virtualenvs, caches, and build artifacts are skipped.
+
 Example shape:
 
 ```json
@@ -76,9 +90,42 @@ Example shape:
     "loops_stopped": 0,
     "session_id": "fp_..."
   },
-  "notes": "No workspace source files were written; the target copy remained unchanged (SHA-256 verified). ..."
+  "notes": "No LLM is configured; the deterministic planner is active. ... No target source files were written; all selected target file(s) remained unchanged (SHA-256 verified). ..."
 }
 ```
+
+## LLM configuration
+
+The LLM layer is optional. Without it, the deterministic planner still scans repositories and generates tests. With it, the LLM chooses repository targets, proposes failure hypotheses, and writes validated pytest functions.
+
+Any OpenAI-compatible chat-completions endpoint works, including hosted gateways and local servers:
+
+| Variable | Purpose |
+| --- | --- |
+| `GREMLIN_LLM_BASE_URL` | Base URL, such as `https://api.openai.com/v1` or `http://localhost:11434/v1` |
+| `GREMLIN_LLM_API_KEY` | Bearer token; may be omitted for local endpoints |
+| `GREMLIN_LLM_MODEL` | Model name; defaults to `gpt-4o-mini` |
+| `GREMLIN_LLM_TIMEOUT` | Request timeout in seconds; defaults to `90` |
+| `GREMLIN_LLM_MAX_TOKENS` | Per-request token cap; defaults to `4096` |
+| `GREMLIN_LLM_ENABLED` | Set to `0` to force deterministic mode |
+
+`OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `OPENAI_MODEL` are accepted as fallbacks. Generated code is parsed and rejected if it imports network or process modules, writes files, calls `eval`/`exec`, or otherwise violates the test policy. Invalid LLM output falls back to the deterministic planner.
+
+```powershell
+$env:GREMLIN_LLM_BASE_URL = "http://localhost:11434/v1"
+$env:GREMLIN_LLM_MODEL = "qwen2.5-coder:7b"
+$env:GREMLIN_LLM_API_KEY = "local"
+uvicorn main:app --port 8000
+```
+
+## Target path configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `GREMLIN_TARGET_ROOT` | One or more allowed roots, separated by the OS path separator (`;` on Windows, `:` elsewhere) |
+| `GREMLIN_ALLOW_ANY_TARGET` | Set to `1` to skip the allowed-root check; only use in a disposable sandbox |
+| `GREMLIN_MAX_SCAN_FILES` | Maximum indexed Python files; defaults to `4000` |
+| `GREMLIN_MAX_TARGET_FILE_BYTES` | Maximum size of an indexed source file; defaults to `1500000` |
 
 ## Failproof integration
 
@@ -157,11 +204,16 @@ The response metrics (`tool_calls`, `blocks`, `loops_stopped`, `session_id`) are
 ├── main.py                         # FastAPI app and /chaos, /health
 ├── agent/
 │   ├── failproof.py                # Failproof session, policies, metrics
-│   └── runner.py                   # Gremlin analysis, planning, execution
+│   ├── llm.py                      # OpenAI-compatible planner and code validation
+│   ├── prompts.py                  # Shared Gremlin system prompt
+│   ├── repo.py                     # Safe target resolution and repository scanner
+│   └── runner.py                   # Gremlin orchestration and execution
 ├── targets/
 │   └── calculator.py               # Sample target
 ├── tests/
 │   ├── test_api.py                 # Service tests
+│   ├── test_llm.py                 # Generated-code validation tests
+│   ├── test_repo.py                # Scanner and target-path tests
 │   └── chaos/                      # Gremlin writes generated tests here
 ├── .failproofai/policies/
 │   └── gremlin-policies.ts         # Harness-level Failproof policies
@@ -180,11 +232,11 @@ Generated chaos files are ignored by git and excluded from the project test suit
 pytest
 ```
 
-The API tests exercise `/health`, a real `POST /chaos` run, source immutability, Failproof policy blocking, and invalid-code handling.
+The tests exercise `/health`, real `POST /chaos` runs, local repository targeting, allowed-root enforcement, target immutability, Failproof policy blocking, generated-code validation, and invalid-code handling.
 
 ## Gremlin system prompt
 
-The runtime uses the following role definition (also exported as `GREMLIN_SYSTEM_PROMPT` in `agent/runner.py`):
+The runtime uses the following role definition, defined in `agent/prompts.py` and exported as `GREMLIN_SYSTEM_PROMPT` from `agent/runner.py`:
 
 ```text
 You are Gremlin, a specialized Chaos Engineering agent.
