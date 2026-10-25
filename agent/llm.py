@@ -424,11 +424,17 @@ Rules:
             raise LLMError(f"LLM connection failed: {exc.reason}") from exc
         except TimeoutError as exc:
             raise LLMError("LLM request timed out.") from exc
+        except OSError as exc:
+            raise LLMError(f"LLM connection failed: {type(exc).__name__}") from exc
+        except ValueError as exc:
+            raise LLMError("The configured LLM base URL is invalid.") from exc
 
         try:
             data = json.loads(raw.decode("utf-8", errors="replace"))
         except json.JSONDecodeError as exc:
             raise LLMError("LLM returned invalid JSON.") from exc
+        if not isinstance(data, dict):
+            raise LLMError("LLM response was not a JSON object.")
 
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
@@ -517,8 +523,10 @@ def validate_test_code(code: str) -> str | None:
             return f"The generated test calls a blocked function: {name}."
         if name.rsplit(".", 1)[-1] in _BANNED_METHODS:
             return f"The generated test performs a blocked filesystem operation: {name}."
-        if (name == "open" or name.endswith(".open")) and _open_call_writes(node):
-            return "The generated test opens a file for writing."
+        if name == "open" or name.endswith(".open"):
+            if _open_call_writes(node):
+                return "The generated test opens a file for writing."
+            return "The generated test performs a blocked file operation: open."
 
     for pattern in _BANNED_TEXT:
         if pattern.search(code):
@@ -578,7 +586,13 @@ def _strip_fence(text: str) -> str:
 def _clean_code(value: Any) -> str:
     if not isinstance(value, str):
         return ""
-    return _strip_fence(value).strip()
+    text = _strip_fence(value).strip()
+    lines = [
+        line
+        for line in text.splitlines()
+        if not line.lstrip().startswith("from __future__ import ")
+    ]
+    return "\n".join(lines).strip()
 
 
 def _dict_list(value: Any) -> list[dict[str, Any]]:
