@@ -1,1 +1,0 @@
-"""Sample targets for Gremlin."""

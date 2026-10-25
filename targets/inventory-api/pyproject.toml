@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inventory-api"
+version = "0.1.0"
+description = "A FastAPI inventory service used as a chaos-engineering target"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110,<1.0",
+    "httpx>=0.27,<1.0",
+    "PyJWT>=2.8,<3.0",
+    "email-validator>=2.1,<3.0",
+    "pydantic-settings>=2.2,<3.0",
+    "sqlalchemy>=2.0,<3.0",
+    "uvicorn[standard]>=0.29,<1.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0,<9.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.setuptools.packages.find]
+where = ["src"]
